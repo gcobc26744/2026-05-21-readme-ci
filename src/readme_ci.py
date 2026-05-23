@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import pathlib
 import subprocess
@@ -12,27 +13,63 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
 
-def _iter_workspace_readmes(repo_root: pathlib.Path) -> list[pathlib.Path]:
+def _posix_relpath(path: pathlib.Path, root: pathlib.Path) -> str:
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except Exception:
+        rel = path
+    return rel.as_posix()
+
+
+def _matches_any_glob(path: pathlib.Path, root: pathlib.Path, globs: list[str]) -> bool:
+    if not globs:
+        return False
+    rel = _posix_relpath(path, root)
+    return any(fnmatch.fnmatch(rel, g) for g in globs)
+
+
+def _iter_workspace_readmes(
+    repo_root: pathlib.Path,
+    *,
+    exclude_dirs: set[str],
+    include_globs: list[str],
+    exclude_globs: list[str],
+) -> list[pathlib.Path]:
     readmes: list[pathlib.Path] = []
 
     root_readme = repo_root / "README.md"
     if root_readme.exists():
-        readmes.append(root_readme)
+        if (not include_globs or _matches_any_glob(root_readme, repo_root, include_globs)) and (
+            not _matches_any_glob(root_readme, repo_root, exclude_globs)
+        ):
+            readmes.append(root_readme)
 
     projects_dir = repo_root / "projects"
     if projects_dir.exists():
         for child in projects_dir.iterdir():
             if not child.is_dir():
                 continue
+            if child.name in exclude_dirs:
+                continue
             readme = child / "README.md"
             if readme.exists():
+                if include_globs and not _matches_any_glob(readme, repo_root, include_globs):
+                    continue
+                if _matches_any_glob(readme, repo_root, exclude_globs):
+                    continue
                 readmes.append(readme)
 
     return sorted(set(readmes))
 
 
-def _iter_all_readmes(root: pathlib.Path) -> list[pathlib.Path]:
-    exclude_dir_parts = {
+def _iter_all_readmes(
+    root: pathlib.Path,
+    *,
+    exclude_dirs: set[str],
+    include_globs: list[str],
+    exclude_globs: list[str],
+) -> list[pathlib.Path]:
+    exclude_dir_parts = set(exclude_dirs) | {
         ".git",
         ".venv",
         "__pycache__",
@@ -50,7 +87,12 @@ def _iter_all_readmes(root: pathlib.Path) -> list[pathlib.Path]:
         dirnames[:] = [d for d in dirnames if d not in exclude_dir_parts]
 
         if "README.md" in filenames:
-            readmes.append(dir_path / "README.md")
+            readme = dir_path / "README.md"
+            if include_globs and not _matches_any_glob(readme, root, include_globs):
+                continue
+            if _matches_any_glob(readme, root, exclude_globs):
+                continue
+            readmes.append(readme)
     return sorted(set(readmes))
 
 
@@ -84,6 +126,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Scan every README.md under root (includes non-project folders).",
     )
+    parser.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Skip directories with this name (repeatable).",
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Only check README paths matching this glob (repeatable; relative to root).",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Skip README paths matching this glob (repeatable; relative to root).",
+    )
     return parser
 
 
@@ -96,10 +159,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"readme-doctor not found: {doctor_py}", file=sys.stderr)
         return 2
 
+    exclude_dirs = {d for d in (args.exclude_dir or []) if d}
+    include_globs = [g for g in (args.include or []) if g]
+    exclude_globs = [g for g in (args.exclude or []) if g]
+
     if args.all:
-        readmes = _iter_all_readmes(root)
+        readmes = _iter_all_readmes(
+            root,
+            exclude_dirs=exclude_dirs,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+        )
     else:
-        readmes = _iter_workspace_readmes(root)
+        readmes = _iter_workspace_readmes(
+            root,
+            exclude_dirs=exclude_dirs,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+        )
     if not readmes:
         print(f"No README.md files found under: {root}")
         return 0
